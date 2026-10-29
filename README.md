@@ -8,7 +8,7 @@ The controller client uses the [Mihomo REST API](https://wiki.metacubex.one/en/a
 
 - Connect to Clash Verge Rev, Pure Clash, or another Mihomo-compatible controller.
 - View the controller version, current routing mode, and mixed port.
-- Change a proxy group's selected node, switch routing modes, and inspect or close active connections.
+- From a proxy group's member submenu, choose to test that node's delay or select it; also view current upload/download rates and totals, switch routing modes, and inspect or close active connections.
 - Optionally validate a Mihomo YAML config and start/stop a kernel managed by this app.
 
 ## Requirements

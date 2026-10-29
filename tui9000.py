@@ -21,6 +21,8 @@ from typing import Any
 
 APP_NAME = "tui-9000"
 DEFAULT_ENDPOINT = "http://127.0.0.1:9097"
+DEFAULT_DELAY_URL = "https://www.gstatic.com/generate_204"
+DEFAULT_DELAY_TIMEOUT_MS = 5000
 
 
 def config_dir() -> Path:
@@ -55,7 +57,14 @@ class MihomoApi:
         self.secret = secret
         self.timeout = timeout
 
-    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        first_line: bool = False,
+    ) -> Any:
         data = None if body is None else json.dumps(body).encode("utf-8")
         headers = {"Accept": "application/json"}
         if data is not None:
@@ -70,7 +79,7 @@ class MihomoApi:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                payload = response.read()
+                payload = response.readline() if first_line else response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace").strip()
             if exc.code in (401, 403):
@@ -94,6 +103,16 @@ class MihomoApi:
 
     def proxies(self) -> dict[str, Any]:
         return self.request("GET", "/proxies")
+
+    def proxy_delay(self, proxy: str, url: str, timeout_ms: int) -> int:
+        proxy_path = urllib.parse.quote(proxy, safe="")
+        query = urllib.parse.urlencode({"url": url, "timeout": timeout_ms})
+        result = self.request("GET", f"/proxies/{proxy_path}/delay?{query}")
+        return int(result["delay"])
+
+    def traffic(self) -> dict[str, Any]:
+        # Mihomo streams one JSON object per second from GET /traffic.
+        return self.request("GET", "/traffic", first_line=True)
 
     def select_proxy(self, group: str, member: str) -> None:
         group_path = urllib.parse.quote(group, safe="")
@@ -185,6 +204,7 @@ class App:
                 [
                     ("status", "Test controller / connection status"),
                     ("proxies", "Proxy groups"),
+                    ("traffic", "Current traffic"),
                     ("connections", "Active connections"),
                     ("mode", "Routing mode"),
                     ("kernel", "Start / stop local Mihomo"),
@@ -197,6 +217,7 @@ class App:
             actions = {
                 "status": self.show_status,
                 "proxies": self.proxy_groups,
+                "traffic": self.show_traffic,
                 "connections": self.connections,
                 "mode": self.routing_mode,
                 "kernel": self.kernel_menu,
@@ -227,7 +248,8 @@ class App:
         )
 
     def proxy_groups(self) -> None:
-        proxies = self.api().proxies().get("proxies", {})
+        api = self.api()
+        proxies = api.proxies().get("proxies", {})
         groups = [
             (name, proxy)
             for name, proxy in proxies.items()
@@ -243,9 +265,52 @@ class App:
         group = proxies[group_name]
         members = [(member, "● current" if member == group.get("now") else "") for member in group["all"]]
         member = self.dialog.menu(f"{group_name} · current: {group.get('now', 'unknown')}\n\nChoose a proxy:", members)
-        if member is not None and member != group.get("now"):
-            self.api().select_proxy(group_name, member)
+        if member is None:
+            return
+        action = self.dialog.menu(
+            f"{group_name} → {member}\n\nChoose an action:",
+            [("delay", "Test delay"), ("select", "Select proxy"), ("back", "Back")],
+        )
+        if action is None or action == "back":
+            return
+        if action == "select":
+            if member == group.get("now"):
+                self.dialog.message(f"{group_name} is already using:\n\n{member}")
+                return
+            api.select_proxy(group_name, member)
             self.dialog.message(f"{group_name} is now using:\n\n{member}")
+            return
+        url = self.dialog.input("Delay-test URL:", DEFAULT_DELAY_URL)
+        if url is None:
+            return
+        url = url.strip()
+        if not url:
+            self.dialog.message("Delay-test URL cannot be empty.")
+            return
+        timeout = self.dialog.input("Timeout in milliseconds:", str(DEFAULT_DELAY_TIMEOUT_MS))
+        if timeout is None:
+            return
+        try:
+            timeout_ms = int(timeout)
+            if timeout_ms <= 0:
+                raise ValueError
+        except ValueError:
+            self.dialog.message("Timeout must be a positive number of milliseconds.")
+            return
+        delay = api.proxy_delay(member, url, timeout_ms)
+        self.dialog.message(f"{member}\n\nDelay: {delay} ms\nTest URL: {url}")
+
+    def show_traffic(self) -> None:
+        traffic = self.api().traffic()
+        up = int(traffic.get("up", 0))
+        down = int(traffic.get("down", 0))
+        up_total = int(traffic.get("upTotal", 0))
+        down_total = int(traffic.get("downTotal", 0))
+        self.dialog.message(
+            "Current traffic (sampled now)\n\n"
+            f"Upload: {up:,} B/s  ·  Total: {up_total:,} B\n"
+            f"Download: {down:,} B/s  ·  Total: {down_total:,} B"
+        )
 
     @staticmethod
     def connection_label(connection: dict[str, Any]) -> str:

@@ -5,6 +5,8 @@ set -u
 APP_NAME="tui-9000"
 TITLE="tui-9000 · Mihomo"
 DEFAULT_ENDPOINT="http://127.0.0.1:9097"
+DEFAULT_DELAY_URL="https://www.gstatic.com/generate_204"
+DEFAULT_DELAY_TIMEOUT_MS=5000
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 CONFIG_DIR="$CONFIG_HOME/$APP_NAME"
@@ -110,7 +112,7 @@ show_status() {
 }
 
 proxy_groups() {
-    local data row group current member encoded payload
+    local data row group current member encoded payload action url timeout encoded_member encoded_url delay
     local -a options=() rows=() members=()
     if ! api_request GET /proxies; then api_error_dialog; return; fi
     data="$API_RESPONSE"
@@ -132,14 +134,58 @@ proxy_groups() {
         if [[ "$member" == "$current" ]]; then options+=("$member" "● current"); else options+=("$member" ""); fi
     done
     member=$(choose_menu "$group · current: ${current:-unknown}\n\nChoose a proxy:" "${options[@]}") || return
-    [[ "$member" == "$current" ]] && return
-    encoded=$(jq -rn --arg value "$group" '$value | @uri')
-    payload=$(jq -cn --arg name "$member" '{name:$name}')
-    if api_request PUT "/proxies/$encoded" "$payload"; then
-        show_message "$group is now using:\n\n$member"
-    else
-        api_error_dialog
+    action=$(choose_menu "$group → $member\n\nChoose an action:" \
+        delay "Test delay" \
+        select "Select proxy" \
+        back "Back") || return
+    case "$action" in
+        back) return ;;
+        select)
+            if [[ "$member" == "$current" ]]; then show_message "$group is already using:\n\n$member"; return; fi
+            encoded=$(jq -rn --arg value "$group" '$value | @uri')
+            payload=$(jq -cn --arg name "$member" '{name:$name}')
+            if api_request PUT "/proxies/$encoded" "$payload"; then show_message "$group is now using:\n\n$member"; else api_error_dialog; fi
+            ;;
+        delay)
+            url=$(capture_dialog --inputbox "Delay-test URL:" 10 78 "$DEFAULT_DELAY_URL") || return
+            [[ -n "$url" ]] || { show_message "Delay-test URL cannot be empty."; return; }
+            timeout=$(capture_dialog --inputbox "Timeout in milliseconds:" 10 78 "$DEFAULT_DELAY_TIMEOUT_MS") || return
+            [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { show_message "Timeout must be a positive number of milliseconds."; return; }
+            encoded_member=$(jq -rn --arg value "$member" '$value | @uri')
+            encoded_url=$(jq -rn --arg value "$url" '$value | @uri')
+            if ! api_request GET "/proxies/$encoded_member/delay?url=$encoded_url&timeout=$timeout"; then api_error_dialog; return; fi
+            delay=$(jq -r '.delay // "unknown"' <<<"$API_RESPONSE")
+            show_message "$member\n\nDelay: $delay ms\nTest URL: $url"
+            ;;
+        *) show_message "Unexpected proxy action: $action" ;;
+    esac
+}
+
+show_traffic() {
+    local raw status first_line curl_status upload download upload_total download_total
+    local -a args=(--silent --show-error --no-buffer --connect-timeout 3 --max-time 3 \
+        --header 'Accept: application/json' --write-out $'\n%{http_code}')
+    [[ -z "$SECRET" ]] || args+=(--header "Authorization: Bearer $SECRET")
+    if raw=$(curl "${args[@]}" "${ENDPOINT}/traffic" 2>/dev/null); then curl_status=0; else curl_status=$?; fi
+    status="${raw##*$'\n'}"
+    first_line="${raw%%$'\n'*}"
+    if [[ "$status" == 401 || "$status" == 403 ]]; then
+        show_message "Mihomo rejected the Bearer token. Check the Clash Verge Rev External Controller secret."
+        return
     fi
+    if [[ "$status" != 200 ]] || ! jq -e 'type == "object" and has("up") and has("down")' <<<"$first_line" >/dev/null 2>&1; then
+        if ((curl_status != 0)) && [[ -z "$first_line" ]]; then
+            show_message "Cannot read traffic from $ENDPOINT. Check the controller connection and try again."
+        else
+            show_message "Mihomo returned an unexpected traffic response:\n$first_line"
+        fi
+        return
+    fi
+    upload=$(jq -r '.up // 0' <<<"$first_line")
+    download=$(jq -r '.down // 0' <<<"$first_line")
+    upload_total=$(jq -r '.upTotal // 0' <<<"$first_line")
+    download_total=$(jq -r '.downTotal // 0' <<<"$first_line")
+    show_message "Current traffic (sampled now)\n\nUpload: $upload B/s  ·  Total: $upload_total B\nDownload: $download B/s  ·  Total: $download_total B"
 }
 
 routing_mode() {
@@ -376,6 +422,7 @@ main() {
     while choice=$(choose_menu "Controller: $ENDPOINT\n\nUse ↑/↓ and Enter to choose an action." \
         status "Test controller / connection status" \
         proxies "Proxy groups" \
+        traffic "Current traffic" \
         connections "Active connections" \
         mode "Routing mode" \
         kernel "Start / stop local Mihomo" \
@@ -384,6 +431,7 @@ main() {
         case "$choice" in
             status) show_status ;;
             proxies) proxy_groups ;;
+            traffic) show_traffic ;;
             connections) active_connections ;;
             mode) routing_mode ;;
             kernel) kernel_menu ;;
